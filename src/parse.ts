@@ -19,7 +19,7 @@
 // ignored entries get .resume() called on them straight away
 
 import { EventEmitter as EE } from 'events'
-import { BrotliDecompress, Unzip } from 'minizlib'
+import { BrotliDecompress, Unzip, ZstdDecompress } from 'minizlib'
 import { Yallist } from 'yallist'
 import { Header } from './header.js'
 import { TarOptions } from './options.js'
@@ -33,6 +33,7 @@ import {
 
 const maxMetaEntrySize = 1024 * 1024
 const gzipHeader = Buffer.from([0x1f, 0x8b])
+const zstdHeader = Buffer.from([0x28, 0xb5, 0x2f, 0xfd])
 
 const STATE = Symbol('state')
 const WRITEENTRY = Symbol('writeEntry')
@@ -75,6 +76,7 @@ export class Parser extends EE implements Warner {
   maxMetaEntrySize: number
   filter: Exclude<TarOptions['filter'], undefined>
   brotli?: TarOptions['brotli']
+  zstd?: TarOptions['zstd']
 
   writable: true = true
   readable: false = false;
@@ -89,7 +91,7 @@ export class Parser extends EE implements Warner {
   [EX]?: Pax;
   [GEX]?: Pax;
   [ENDED]: boolean = false;
-  [UNZIP]?: false | Unzip | BrotliDecompress;
+  [UNZIP]?: false | Unzip | BrotliDecompress | ZstdDecompress;
   [ABORTED]: boolean = false;
   [SAW_VALID_ENTRY]?: boolean;
   [SAW_NULL_BLOCK]: boolean = false;
@@ -137,9 +139,19 @@ export class Parser extends EE implements Warner {
     // if it's a tbr file it MIGHT be brotli, but we don't know until
     // we look at it and verify it's not a valid tar file.
     this.brotli =
-      !opt.gzip && opt.brotli !== undefined ? opt.brotli
+      !(opt.gzip || opt.zstd) && opt.brotli !== undefined ? opt.brotli
       : isTBR ? undefined
-      : false
+        : false
+
+    // zstd has magic bytes to identify it, but we also support explicit options
+    // and file extension detection
+    const isTZST =
+      opt.file &&
+      (opt.file.endsWith('.tar.zst') || opt.file.endsWith('.tzst'))
+    this.zstd =
+      !(opt.gzip || opt.brotli) && opt.zstd !== undefined ? opt.zstd
+      : isTZST ? true
+        : undefined
 
     // have to set this so that streams are ok piping into it
     this.on('end', () => this[CLOSESTREAM]())
@@ -433,7 +445,7 @@ export class Parser extends EE implements Warner {
       return false
     }
 
-    // first write, might be gzipped
+    // first write, might be gzipped, zstd, or brotli compressed
     const needSniff =
       this[UNZIP] === undefined ||
       (this.brotli === undefined && this[UNZIP] === false)
@@ -442,7 +454,7 @@ export class Parser extends EE implements Warner {
         chunk = Buffer.concat([this[BUFFER], chunk])
         this[BUFFER] = undefined
       }
-      if (chunk.length < gzipHeader.length) {
+      if (chunk.length < Math.max(gzipHeader.length, zstdHeader.length)) {
         this[BUFFER] = chunk
         /* c8 ignore next */
         cb?.()
@@ -460,7 +472,19 @@ export class Parser extends EE implements Warner {
         }
       }
 
-      const maybeBrotli = this.brotli === undefined
+      // look for zstd header if gzip header not found
+      let isZstd = false
+      if (this[UNZIP] === false && this.zstd !== false) {
+        isZstd = true
+        for (let i = 0; i < zstdHeader.length; i++) {
+          if (chunk[i] !== zstdHeader[i]) {
+            isZstd = false
+            break
+          }
+        }
+      }
+
+      const maybeBrotli = this.brotli === undefined && !isZstd
       if (this[UNZIP] === false && maybeBrotli) {
         // read the first header to see if it's a valid tar file. If so,
         // we can safely assume that it's not actually brotli, despite the
@@ -489,13 +513,15 @@ export class Parser extends EE implements Warner {
 
       if (
         this[UNZIP] === undefined ||
-        (this[UNZIP] === false && this.brotli)
+        (this[UNZIP] === false && (this.brotli || isZstd))
       ) {
         const ended = this[ENDED]
         this[ENDED] = false
         this[UNZIP] =
           this[UNZIP] === undefined ?
             new Unzip({})
+          : isZstd ?
+            new ZstdDecompress({})
           : new BrotliDecompress({})
         this[UNZIP].on('data', chunk => this[CONSUMECHUNK](chunk))
         this[UNZIP].on('error', er => this.abort(er as Error))
@@ -676,7 +702,7 @@ export class Parser extends EE implements Warner {
         this[UNZIP].end()
       } else {
         this[ENDED] = true
-        if (this.brotli === undefined)
+        if (this.brotli === undefined || this.zstd === undefined)
           chunk = chunk || Buffer.alloc(0)
         if (chunk) this.write(chunk)
         this[MAYBEEND]()

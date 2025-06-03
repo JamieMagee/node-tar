@@ -24,11 +24,12 @@
     "@isaacs/fs-minipass": "^4.0.0",
     "chownr": "^3.0.0",
     "minipass": "^7.1.2",
-    "minizlib": "^3.0.1",
+    "minizlib": "file:../minizlib/dist/commonjs",
     "mkdirp": "^3.0.1",
     "yallist": "^5.0.0"
   },
   "devDependencies": {
+    "@types/node": "^22.15.29",
     "chmodr": "^1.2.0",
     "end-of-stream": "^1.4.3",
     "events-to-array": "^2.0.3",
